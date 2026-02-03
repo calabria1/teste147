@@ -1,14 +1,11 @@
-name: Terraform Apply
+name: Deploy (Lambda + Terraform)
 
 on:
   workflow_dispatch:
   push:
-    branches:
-      - main
+    branches: [main]
     paths:
-      - "infra/**"
       - "services/**"
-      - "todo-api/**"
       - ".github/workflows/terraform.yml"
 
 permissions:
@@ -16,21 +13,37 @@ permissions:
   contents: read
 
 jobs:
-  terraform:
+  deploy:
     runs-on: ubuntu-latest
-    defaults:
-      run:
-        working-directory: todo-infra/todo-infra
     env:
       TF_IN_AUTOMATION: true
       AWS_REGION: ${{ secrets.AWS_REGION }}
+
     steps:
-      - name: Checkout infra repo
+      # 1) Repo atual (todo-api)
+      - name: Checkout todo-api
+        uses: actions/checkout@v4
+
+      # 2) Repo infra (todo-infra) - ESSENCIAL para não quebrar os paths
+      - name: Checkout todo-infra
         uses: actions/checkout@v4
         with:
+          repository: SUAORG/todo-infra
           path: todo-infra
+          token: ${{ secrets.GH_PAT }}
 
-      - name: Configure AWS credentials
+      # 3) Debug (deixe até estabilizar; depois pode remover)
+      - name: Debug paths
+        run: |
+          echo "== ROOT =="
+          pwd
+          ls -la
+          echo "== todo-infra =="
+          ls -la todo-infra
+          echo "== find package script =="
+          find . -maxdepth 8 -type f -name "package_lambda.sh" -print
+
+      - name: Configure AWS credentials (OIDC)
         uses: aws-actions/configure-aws-credentials@v4
         with:
           role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
@@ -41,39 +54,33 @@ jobs:
         with:
           terraform_version: 1.6.0
 
-      - name: Package Lambda
+      # 4) Package Lambda zip (usando o script do todo-infra)
+      - name: Package Lambda (tasks)
         run: |
-          chmod +x infra/scripts/package_lambda.sh
-          LAMBDA_SRC_DIR=services/tasks/src ZIP_PATH=build/tasks.zip infra/scripts/package_lambda.sh
+          cp -f services/tasks/requirements.txt services/tasks/src/requirements.txt || true
+          chmod +x todo-infra/todo-infra/infra/scripts/package_lambda.sh
+          mkdir -p build
+          LAMBDA_SRC_DIR=services/tasks/src \
+          ZIP_PATH=build/tasks.zip \
+          todo-infra/todo-infra/infra/scripts/package_lambda.sh
 
+      # 5) Upload do zip para o bucket de artifacts (bucket vem do tfvars do todo-infra)
       - name: Upload Lambda artifact to S3
         run: |
-          BUCKET=$(grep -E '^artifacts_bucket' infra/envs/dev/terraform.tfvars | awk -F'=' '{print $2}' | tr -d ' "')
+          TFVARS="todo-infra/todo-infra/infra/envs/dev/terraform.tfvars"
+          BUCKET=$(grep -E '^[[:space:]]*artifacts_bucket' "$TFVARS" | awk -F'=' '{print $2}' | tr -d ' "')
           if [[ -z "${BUCKET}" ]]; then
-            echo "artifacts_bucket not set in terraform outputs or tfvars" >&2
+            echo "artifacts_bucket not found in $TFVARS" >&2
             exit 1
           fi
+
           aws s3 cp build/tasks.zip "s3://${BUCKET}/lambdas/tasks/${GITHUB_SHA}.zip"
 
-      - name: Terraform init
-        run: terraform -chdir=infra/envs/dev init
+      # 6) Terraform apply no repo infra (aponta pro artifact version do commit)
+      - name: Terraform init (dev)
+        run: terraform -chdir=todo-infra/todo-infra/infra/envs/dev init
 
-      - name: Terraform import (best effort)
-        run: |
-          set +e
-          PROJECT=$(grep -E '^project' infra/envs/dev/terraform.tfvars | awk -F'=' '{print $2}' | tr -d ' "')
-          ENV=$(grep -E '^env' infra/envs/dev/terraform.tfvars | awk -F'=' '{print $2}' | tr -d ' "')
-          BUCKET=$(grep -E '^artifacts_bucket' infra/envs/dev/terraform.tfvars | awk -F'=' '{print $2}' | tr -d ' "')
-          NAME="${PROJECT}-${ENV}"
-          terraform -chdir=infra/envs/dev import module.artifacts.aws_s3_bucket.this "${BUCKET}"
-          terraform -chdir=infra/envs/dev import module.artifacts.aws_s3_bucket_public_access_block.this "${BUCKET}"
-          terraform -chdir=infra/envs/dev import module.artifacts.aws_s3_bucket_versioning.this "${BUCKET}"
-          terraform -chdir=infra/envs/dev import module.dynamodb.aws_dynamodb_table.this "${NAME}-tasks"
-          terraform -chdir=infra/envs/dev import module.lambda_tasks.aws_iam_role.this "${NAME}-tasks-role"
-          terraform -chdir=infra/envs/dev import module.lambda_tasks.aws_iam_role_policy.this "${NAME}-tasks-role:${NAME}-tasks-policy"
-          set -e
-
-      - name: Terraform apply
+      - name: Terraform apply (dev)
         env:
           TF_VAR_lambda_artifact_version: ${{ github.sha }}
-        run: terraform -chdir=infra/envs/dev apply -auto-approve
+        run: terraform -chdir=todo-infra/todo-infra/infra/envs/dev apply -auto-approve
