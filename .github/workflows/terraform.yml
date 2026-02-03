@@ -17,21 +17,30 @@ jobs:
   deploy:
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout código da API
+      - name: Checkout do repositório
         uses: actions/checkout@v4
 
-      - name: Configure AWS credentials (OIDC)
+      - name: Debug da estrutura (pra achar o src)
+        run: |
+          set -euo pipefail
+          echo "PWD=$(pwd)"
+          echo "Raiz:"
+          ls -la
+          echo "Árvore (2 níveis):"
+          find . -maxdepth 2 -type d -print
+
+      - name: Configurar credenciais AWS (OIDC)
         uses: aws-actions/configure-aws-credentials@v4
         with:
           role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
           aws-region: ${{ env.AWS_REGION }}
 
-      - name: Setup Python
+      - name: Configurar Python
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
 
-      - name: Build Lambda zip (tarefas)
+      - name: Build do ZIP da Lambda (autodetect)
         run: |
           set -euo pipefail
 
@@ -39,26 +48,50 @@ jobs:
           echo "ARTIFACT_VERSION=$ARTIFACT_VERSION" >> $GITHUB_ENV
 
           ROOT="$(pwd)"
-          SRC_DIR="$ROOT/services/tasks/src"
-          REQ_FILE="$ROOT/services/tasks/requirements.txt"
           OUT_DIR="$ROOT/build"
           PKG_DIR="$ROOT/.package/tarefas"
 
           rm -rf "$OUT_DIR" "$PKG_DIR"
           mkdir -p "$OUT_DIR" "$PKG_DIR"
 
-          python -m pip install --upgrade pip
-          if [ -f "$REQ_FILE" ]; then
-            python -m pip install -r "$REQ_FILE" -t "$PKG_DIR"
+          # 🔎 Encontra a pasta onde está o handler.py
+          HANDLER_PATH="$(find . -type f -name 'handler.py' | head -n 1 || true)"
+          if [ -z "$HANDLER_PATH" ]; then
+            echo "Não encontrei handler.py no repositório. Verifique o caminho do código."
+            exit 1
           fi
 
+          SRC_DIR="$(dirname "$HANDLER_PATH")"
+          echo "Usando SRC_DIR=$SRC_DIR"
+
+          # 🔎 Procura requirements.txt (prioriza o mais próximo do src)
+          REQ_FILE=""
+          if [ -f "$SRC_DIR/requirements.txt" ]; then
+            REQ_FILE="$SRC_DIR/requirements.txt"
+          elif [ -f "$(dirname "$SRC_DIR")/requirements.txt" ]; then
+            REQ_FILE="$(dirname "$SRC_DIR")/requirements.txt"
+          elif [ -f "requirements.txt" ]; then
+            REQ_FILE="requirements.txt"
+          fi
+
+          python -m pip install --upgrade pip
+          if [ -n "$REQ_FILE" ]; then
+            echo "Instalando dependências de: $REQ_FILE"
+            python -m pip install -r "$REQ_FILE" -t "$PKG_DIR"
+          else
+            echo "Nenhum requirements.txt encontrado. Empacotando apenas o código."
+          fi
+
+          # Copia o código do src para dentro do pacote
           cp -R "$SRC_DIR/"* "$PKG_DIR/"
+
+          # Gera o zip
           (cd "$PKG_DIR" && zip -qr "$OUT_DIR/tasks.zip" .)
 
-          echo "Built: $OUT_DIR/tasks.zip"
+          echo "ZIP gerado: $OUT_DIR/tasks.zip"
           ls -lh "$OUT_DIR/tasks.zip"
 
-      - name: Upload Lambda zip to S3
+      - name: Upload do ZIP para o S3
         run: |
           set -euo pipefail
           aws s3 cp build/tasks.zip "s3://${{ env.ARTIFACTS_BUCKET }}/lambdas/tasks/${ARTIFACT_VERSION}.zip"
