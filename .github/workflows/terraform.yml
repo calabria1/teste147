@@ -1,12 +1,9 @@
-name: Deploy (todo-api -> AWS dev)
+name: Deploy API (Lambda) + Terraform (infra repo)
 
 on:
-  push:
-    branches: [main]
-    paths:
-      - "services/**"
-      - ".github/workflows/deploy-dev.yml"
   workflow_dispatch:
+  push:
+    branches: [ "main" ]
 
 permissions:
   id-token: write
@@ -14,24 +11,26 @@ permissions:
 
 env:
   AWS_REGION: sa-east-1
-  ARTIFACTS_BUCKET: todo-calabrial-artifacts-123
-  TF_WORKING_DIR: todo-infra/todo-infra/infra/envs/dev
+
+  # Esses 4 têm que bater com o que você usou quando provisionou a infra originalmente
+  TF_VAR_project: todo
+  TF_VAR_env: dev
+  TF_VAR_aws_region: sa-east-1
+  TF_VAR_artifacts_bucket: todo-calabrial-artifacts-123
 
 jobs:
   deploy:
     runs-on: ubuntu-latest
 
     steps:
-      # 1) Checkout do repo atual (todo-api)
       - name: Checkout todo-api
         uses: actions/checkout@v4
 
-      # 2) Checkout do repo todo-infra (PUBLICO)
-      - name: Checkout todo-infra
+      # Checkout do repo público NÃO precisa token.
+      - name: Checkout todo-infra (public repo)
         uses: actions/checkout@v4
         with:
-          repository: escoladoestudante/todo-infra
-          ref: main
+          repository: calabria1/todo-infra
           path: todo-infra
           fetch-depth: 1
 
@@ -46,51 +45,64 @@ jobs:
         with:
           python-version: "3.11"
 
-      # 3) Build ZIP da lambda (limpo) com deps
-      - name: Build Lambda package (tasks)
+      - name: Build Lambda zip (tasks)
         run: |
           set -euo pipefail
 
-          SRC_DIR="services/tasks/src"
-          REQ_FILE="services/tasks/requirements.txt"
+          ARTIFACT_VERSION="${GITHUB_SHA:0:7}"
+          echo "ARTIFACT_VERSION=$ARTIFACT_VERSION" >> $GITHUB_ENV
 
-          rm -rf build
-          mkdir -p build/lambda
+          ROOT="$(pwd)"
+          SRC_DIR="$ROOT/todo-api/services/tasks/src"
+          REQ_FILE="$ROOT/todo-api/services/tasks/requirements.txt"
+          OUT_DIR="$ROOT/build"
+          PKG_DIR="$ROOT/.package/tasks"
 
-          # copia código (handler.py precisa ficar na raiz do zip)
-          rsync -av --exclude '__pycache__' --exclude '*.pyc' "${SRC_DIR}/" build/lambda/
+          rm -rf "$OUT_DIR" "$PKG_DIR"
+          mkdir -p "$OUT_DIR" "$PKG_DIR"
 
-          # instala deps no build/lambda
+          # instala deps dentro do package dir
           python -m pip install --upgrade pip
-          if [ -f "${REQ_FILE}" ]; then
-            pip install -r "${REQ_FILE}" -t build/lambda
-          else
-            echo "requirements.txt nao encontrado em ${REQ_FILE}"
+          if [ -f "$REQ_FILE" ]; then
+            python -m pip install -r "$REQ_FILE" -t "$PKG_DIR"
           fi
 
-          # cria zip
-          (cd build/lambda && zip -r "../tasks.zip" .)
-          ls -lh build/tasks.zip
-          
-      # 4) Upload para S3 usando a versão = GITHUB_SHA (igual ao TF_VAR)
-      - name: Upload Lambda artifact to S3
+          # copia o código da lambda para a RAIZ do zip (handler.py no root)
+          cp -R "$SRC_DIR/"* "$PKG_DIR/"
+
+          # zipa tudo
+          (cd "$PKG_DIR" && zip -qr "$OUT_DIR/tasks.zip" .)
+
+          echo "Built: $OUT_DIR/tasks.zip"
+          ls -lh "$OUT_DIR/tasks.zip"
+
+      - name: Upload Lambda zip to S3
         run: |
           set -euo pipefail
-          aws s3 cp build/tasks.zip \
-            "s3://${ARTIFACTS_BUCKET}/lambdas/tasks/${GITHUB_SHA}.zip"
+          aws s3 cp build/tasks.zip "s3://${TF_VAR_artifacts_bucket}/lambdas/tasks/${ARTIFACT_VERSION}.zip"
+          aws s3 cp build/tasks.zip "s3://${TF_VAR_artifacts_bucket}/lambdas/tasks/latest.zip"
 
       - name: Setup Terraform
         uses: hashicorp/setup-terraform@v3
         with:
           terraform_version: "1.6.6"
 
-      - name: Terraform init
-        working-directory: ${{ env.TF_WORKING_DIR }}
+      - name: Terraform Init (todo-infra env dev)
+        working-directory: todo-infra/todo-infra/infra/envs/dev
         run: terraform init
 
-      # 5) APPLY apontando a lambda pra esse zip novo
-      - name: Terraform apply (update lambda)
-        working-directory: ${{ env.TF_WORKING_DIR }}
-        env:
-          TF_VAR_lambda_artifact_version: ${{ github.sha }}
-        run: terraform apply -auto-approve
+      - name: Terraform Plan
+        working-directory: todo-infra/todo-infra/infra/envs/dev
+        run: |
+          set -euo pipefail
+          terraform plan \
+            -var="lambda_artifact_version=${ARTIFACT_VERSION}" \
+            -out=tfplan
+
+      - name: Terraform Apply
+        working-directory: todo-infra/todo-infra/infra/envs/dev
+        run: terraform apply -auto-approve tfplan
+
+      - name: Show Outputs
+        working-directory: todo-infra/todo-infra/infra/envs/dev
+        run: terraform output
