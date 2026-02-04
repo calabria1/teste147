@@ -30,7 +30,7 @@ def lambda_handler(event: Dict[str, Any], context: Any):
         if req.method == "GET" and tarefa_id:
             item = _repo.get(tarefa_id)
             if not item:
-                return response(404, {"mensaagem": "Tarefa não encontrada"})
+                return response(404, {"mensagem": "Tarefa não encontrada"})
             return response(200, item)
 
         if req.method == "PUT" and tarefa_id:
